@@ -1,0 +1,5 @@
+transformers
+torch
+scipy
+numpy
+huggingface_hub
