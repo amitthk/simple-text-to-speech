@@ -2,3 +2,4 @@
 data/
 AGENTS.md
 model_tts/
+audio_cache/
