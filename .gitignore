@@ -2,4 +2,7 @@
 data/
 AGENTS.md
 model_tts/
+model_tts_female/
 audio_cache/
+.aider*
+nohup.out
