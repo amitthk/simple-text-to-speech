@@ -6,13 +6,13 @@ INSTALLATION:
    pip install transformers torch scipy numpy huggingface_hub
 
 2. Download model to local folder:
-   python download_hf_minimal.py --repo-id kakao-enterprise/vits-ljs --output-dir model_tts_female
+   python download_hf_minimal.py --repo-id facebook/mms-tts-eng --output-dir model_tts
 
 3. Run script (will use local model):
    python generate.py --text-file togaf.txt
 
 Model size: ~400MB
-Location: model_tts_female/ folder
+Location: model_tts/ folder
 """
 
 import argparse
@@ -24,15 +24,12 @@ import torch
 from transformers import VitsModel, AutoTokenizer
 import numpy as np
 import scipy.io.wavfile as wavfile
-from scipy import signal
 
 # ------------------ CONFIG ------------------
 LANGUAGE = "en"  # Language code
-SPEAKER_ID = 0  # Single-speaker model; kept for compatibility
+SPEAKER_ID = 0  # Voice variant (0-10 for different voices)
 MAX_CHARS_PER_CHUNK = 600  # Reduce memory use for long inputs
 PAUSE_SECONDS = 2.0  # Pause between paragraphs/sections
-SPEED_FACTOR = 1.0  # >1.0 is faster, <1.0 is slower
-MODEL_DIR = Path("model_tts_female")
 CACHE_DIR = Path("audio_cache")
 # -------------------------------------------
 
@@ -64,15 +61,16 @@ output_audio = text_path.with_name(f"{text_path.stem}_{short_hash}.wav")
 
 print("Loading VITS text-to-speech model...")
 # Ensure local model exists to avoid unexpected network calls.
-if not MODEL_DIR.exists():
+model_dir = Path("model_tts")
+if not model_dir.exists():
     raise FileNotFoundError(
-        "Local model not found at 'model_tts_female'. Run:\n"
-        "  python download_hf_minimal.py --repo-id kakao-enterprise/vits-ljs --output-dir model_tts_female\n"
+        "Local model not found at 'model_tts'. Run:\n"
+        "  python download_hf_minimal.py --repo-id facebook/mms-tts-eng --output-dir model_tts\n"
         "Then rerun generate.py."
     )
 # Load model and tokenizer from local folder
-model = VitsModel.from_pretrained(MODEL_DIR, local_files_only=True)
-tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
+model = VitsModel.from_pretrained(model_dir, local_files_only=True)
+tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
 
 # Check device
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -134,14 +132,6 @@ def _chunk_paragraph(paragraph: str) -> list[str]:
         chunks.append(" ".join(current))
     return chunks
 
-def _apply_speed(waveform: np.ndarray, speed_factor: float) -> np.ndarray:
-    if speed_factor <= 0:
-        raise ValueError("SPEED_FACTOR must be > 0")
-    if speed_factor == 1.0:
-        return waveform
-    new_length = max(1, int(len(waveform) / speed_factor))
-    return signal.resample(waveform, new_length).astype(np.float32)
-
 paragraphs = _split_paragraphs(text)
 chunk_plan = []
 for idx, paragraph in enumerate(paragraphs):
@@ -161,7 +151,6 @@ for idx, entry in enumerate(chunk_plan, start=1):
     inputs = tokenizer(chunk_text, return_tensors="pt").to(device)
     with torch.no_grad():
         waveform = model(**inputs).waveform.squeeze().cpu().numpy()
-    waveform = _apply_speed(waveform, SPEED_FACTOR)
     chunk_paths.append((chunk_path, entry["pause_after"]))
 
     # Write chunk audio as float32 to preserve quality before final normalization.
