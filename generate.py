@@ -29,6 +29,7 @@ import scipy.io.wavfile as wavfile
 LANGUAGE = "en"  # Language code
 SPEAKER_ID = 0  # Voice variant (0-10 for different voices)
 MAX_CHARS_PER_CHUNK = 600  # Reduce memory use for long inputs
+MAX_TOKENS_PER_CHUNK = 350  # Keep VITS attention inputs small and valid
 PAUSE_SECONDS = 2.0  # Pause between paragraphs/sections
 CACHE_DIR = Path("audio_cache")
 # -------------------------------------------
@@ -112,6 +113,35 @@ def _split_paragraphs(value: str) -> list[str]:
 def _split_sentences(value: str) -> list[str]:
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+", value) if s.strip()]
 
+def _split_long_text(value: str) -> list[str]:
+    chunks = []
+    current = []
+    current_len = 0
+    for word in value.split():
+        if len(word) > MAX_CHARS_PER_CHUNK:
+            if current:
+                chunks.append(" ".join(current))
+                current = []
+                current_len = 0
+            chunks.extend(
+                word[start : start + MAX_CHARS_PER_CHUNK]
+                for start in range(0, len(word), MAX_CHARS_PER_CHUNK)
+            )
+            continue
+
+        add_len = len(word) + (1 if current else 0)
+        if current_len + add_len > MAX_CHARS_PER_CHUNK and current:
+            chunks.append(" ".join(current))
+            current = [word]
+            current_len = len(word)
+        else:
+            current.append(word)
+            current_len += add_len
+
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
 def _chunk_paragraph(paragraph: str) -> list[str]:
     if len(paragraph) <= MAX_CHARS_PER_CHUNK:
         return [paragraph]
@@ -120,6 +150,14 @@ def _chunk_paragraph(paragraph: str) -> list[str]:
     current = []
     current_len = 0
     for sentence in sentences:
+        if len(sentence) > MAX_CHARS_PER_CHUNK:
+            if current:
+                chunks.append(" ".join(current))
+                current = []
+                current_len = 0
+            chunks.extend(_split_long_text(sentence))
+            continue
+
         add_len = len(sentence) + (1 if current else 0)
         if current_len + add_len > MAX_CHARS_PER_CHUNK and current:
             chunks.append(" ".join(current))
@@ -132,22 +170,71 @@ def _chunk_paragraph(paragraph: str) -> list[str]:
         chunks.append(" ".join(current))
     return chunks
 
+def _token_ids(value: str) -> list[int]:
+    input_ids = tokenizer(value).input_ids
+    if input_ids and isinstance(input_ids[0], list):
+        return input_ids[0]
+    return input_ids
+
+def _split_chunk_by_tokens(value: str) -> list[str]:
+    if len(_token_ids(value)) <= MAX_TOKENS_PER_CHUNK:
+        return [value]
+
+    pieces = []
+    current = []
+    for word in value.split():
+        candidate = " ".join([*current, word]) if current else word
+        if len(_token_ids(candidate)) <= MAX_TOKENS_PER_CHUNK:
+            current.append(word)
+            continue
+
+        if current:
+            pieces.append(" ".join(current))
+            current = []
+
+        if len(_token_ids(word)) <= MAX_TOKENS_PER_CHUNK:
+            current = [word]
+        else:
+            pieces.extend(
+                part
+                for part in _split_long_text(word)
+                if len(_token_ids(part)) > 0
+            )
+
+    if current:
+        pieces.append(" ".join(current))
+    return pieces
+
 paragraphs = _split_paragraphs(text)
 chunk_plan = []
 for idx, paragraph in enumerate(paragraphs):
     para_chunks = _chunk_paragraph(paragraph)
     for c_idx, chunk in enumerate(para_chunks):
         pause_after = (c_idx == len(para_chunks) - 1) and (idx < len(paragraphs) - 1)
-        chunk_plan.append({"text": chunk, "pause_after": pause_after})
+        token_chunks = _split_chunk_by_tokens(chunk)
+        for t_idx, token_chunk in enumerate(token_chunks):
+            token_pause_after = pause_after and t_idx == len(token_chunks) - 1
+            chunk_plan.append({"text": token_chunk, "pause_after": token_pause_after})
+
+if not chunk_plan:
+    raise ValueError("No readable text chunks found in the input file.")
 
 cache_dir = CACHE_DIR / f"{text_path.stem}_{short_hash}"
 cache_dir.mkdir(parents=True, exist_ok=True)
 chunk_paths = []
+skipped_chunks = 0
 
 for idx, entry in enumerate(chunk_plan, start=1):
     chunk_text = entry["text"]
     chunk_path = cache_dir / f"chunk_{idx:04d}.wav"
-    print(f"  Chunk {idx}/{len(chunk_plan)} ({len(chunk_text)} chars)")
+    token_count = len(_token_ids(chunk_text))
+    if token_count == 0:
+        skipped_chunks += 1
+        preview = chunk_text[:80].replace("\n", " ")
+        print(f"  Skipping chunk {idx}/{len(chunk_plan)}: tokenizer produced no tokens ({preview!r})")
+        continue
+
+    print(f"  Chunk {idx}/{len(chunk_plan)} ({len(chunk_text)} chars, {token_count} tokens)")
     inputs = tokenizer(chunk_text, return_tensors="pt").to(device)
     with torch.no_grad():
         waveform = model(**inputs).waveform.squeeze().cpu().numpy()
@@ -173,7 +260,10 @@ for chunk_path, pause_after in chunk_paths:
 
 audio_data = np.concatenate(combined) if combined else np.array([], dtype=np.float32)
 if audio_data.size == 0:
-    raise ValueError("No audio data generated.")
+    raise ValueError(
+        "No audio data generated. The input may be empty after tokenization, "
+        "or it may use characters/languages unsupported by the local English VITS model."
+    )
 
 # Normalize audio to int16 range
 audio_data = np.int16(audio_data / np.max(np.abs(audio_data)) * 32767)
@@ -187,3 +277,5 @@ cache_dir.rmdir()
 print(f"Audio saved → {output_audio}")
 print(f"Sample rate: {sample_rate} Hz")
 print(f"Duration: {len(audio_data)/sample_rate:.2f} seconds")
+if skipped_chunks:
+    print(f"Skipped chunks with no tokenizer output: {skipped_chunks}")
