@@ -6,9 +6,10 @@ Example:
 """
 
 import argparse
+import os
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi, snapshot_download
 
 # ------------------ CONFIG ------------------
 DEFAULT_INCLUDE = [
@@ -49,16 +50,51 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def load_dotenv(path: Path = Path(".env")) -> None:
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def get_hf_token() -> str | None:
+    for name in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        token = os.environ.get(name)
+        if token:
+            return token
+    return None
+
+
 def main() -> None:
     args = parse_args()
+    load_dotenv()
+    token = get_hf_token()
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        HfApi().model_info(repo_id=args.repo_id, token=token)
+    except Exception as exc:
+        raise SystemExit(
+            f"Could not reach Hugging Face repo '{args.repo_id}'. "
+            "Check network access and your HF_TOKEN in .env."
+        ) from exc
 
     snapshot_download(
         repo_id=args.repo_id,
         local_dir=str(output_dir),
-        local_dir_use_symlinks=False,
         allow_patterns=args.include,
+        token=token,
     )
 
     print(f"Downloaded minimal files to {output_dir}")
